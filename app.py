@@ -1,17 +1,19 @@
 # app.py — Gradio front-end that calls test.py IN-PROCESS (Local GPU)
 # Folder layout per run (under TEMP_ROOT):
-#   input_video/<video_stem>/00000.png ...
-#   ref/<video_stem>/ref.png
-#   output/<video_stem>/*.png
-# Final mp4: TEMP_ROOT/<video_stem>.mp4
+#   input_video/<folder_name>/00000.png ...
+#   ref/<folder_name>/ref.png
+#   output/<folder_name>/*.png
+# Output images: output/<folder_name>/*.png
 
 import os
 import sys
 import shutil
 import urllib.request
+import subprocess
 from os import path
 import io
 from contextlib import redirect_stdout, redirect_stderr
+import zipfile
 
 import gradio as gr
 from PIL import Image
@@ -22,25 +24,31 @@ import torch  # used for cuda device set / sync / empty_cache
 CHECKPOINT_URL = "https://github.com/yyang181/colormnet/releases/download/v0.1/DINOv2FeatureV6_LocalAtten_s2_154000.pth"
 CHECKPOINT_LOCAL = "DINOv2FeatureV6_LocalAtten_s2_154000.pth"
 
-TITLE = "ColorMNet — 视频着色 / Video Colorization (Local GPU)"
+TITLE = "ColorMNet — 图像着色 / Image Colorization (Local GPU)"
 DESC = """
 **中文**  
-上传**黑白视频**与**参考图像**，点击「开始着色 / Start Coloring」。  
+上传**黑白图像文件夹路径**与**参考图像**，点击「开始着色 / Start Coloring」。  
 此版本在**本地指定 GPU（如 GPU:0）**上运行，并在**同一进程**调用 `test.py` 的入口函数。  
 临时工作目录结构：  
-- 抽帧：`_colormnet_tmp/input_video/<视频名>/00000.png ...`  
-- 参考：`_colormnet_tmp/ref/<视频名>/ref.png`  
-- 输出：`_colormnet_tmp/output/<视频名>/*.png`  
-- 合成视频：`_colormnet_tmp/<视频名>.mp4`
+- 输入图像：`_colormnet_tmp/input_video/<文件夹名>/00000.png ...`  
+- 参考：`_colormnet_tmp/ref/<文件夹名>/ref.png` (单个) 或 `00000.png, 00001.png...` (多个)  
+- 输出：`_colormnet_tmp/output/<文件夹名>/*.png`  
+
+**支持多参考图像 / Multiple Reference Images Support:**  
+- 单个参考图像：上传一张图像 / Upload single image  
+- 多个参考图像：输入包含多张参考图像的文件夹路径 / Enter folder path with multiple reference images  
 
 **English**  
-Upload a **B&W video** and a **reference image**, then click “Start Coloring”.  
+Upload a **folder path containing B&W images** and **reference image(s)**, then click "Start Coloring".  
 This app runs **on a local, user-selected GPU (e.g., GPU:0)** and calls `test.py` **in-process**.  
 Temp workspace layout:  
-- Frames: `_colormnet_tmp/input_video/<stem>/00000.png ...`  
-- Reference: `_colormnet_tmp/ref/<stem>/ref.png`  
-- Output frames: `_colormnet_tmp/output/<stem>/*.png`  
-- Final video: `_colormnet_tmp/<stem>.mp4`
+- Input images: `_colormnet_tmp/input_video/<folder_name>/00000.png ...`  
+- Reference: `_colormnet_tmp/ref/<folder_name>/ref.png` (single) or `00000.png, 00001.png...` (multiple)  
+- Output images: `_colormnet_tmp/output/<folder_name>/*.png`  
+
+**Multiple Reference Images Support:**  
+- Single reference: Upload one image  
+- Multiple references: Enter folder path containing multiple reference images  
 """
 
 PAPER = """
@@ -77,12 +85,12 @@ REF_GUIDE_MD = r"""
 ## 参考帧制作指南 / Reference Frame Guide
 
 **目的 / Goal**  
-为模型提供一张与你的视频关键帧在**姿态、光照、构图**尽量接近的**彩色参考图**，用来指导整段视频的着色风格与主体颜色。
+为模型提供一张与你的图像在**姿态、光照、构图**尽量接近的**彩色参考图**，用来指导整组图像的着色风格与主体颜色。
 
 ---
 
 ### 中文步骤
-1. **挑帧**：从视频里挑一帧（或相近角度的照片），尽量与要着色的镜头在**姿态 / 光照 / 场景**一致。  
+1. **挑选参考图**：从图像集里挑一张（或相近角度的照片），尽量与要着色的图像在**姿态 / 光照 / 场景**一致。  
 2. **上色方式**：若你只有黑白参考图、但需要彩色参考，可用 **通义千问·图像编辑（Qwen-Image）**：  
    - 打开：<https://chat.qwen.ai/> → 选择**图像编辑**  
    - 上传你的黑白参考图  
@@ -90,9 +98,9 @@ REF_GUIDE_MD = r"""
      **「帮我给这张照片上色，只修改颜色，不要修改内容」**  
    - 可按需多次编辑（如补充「衣服为复古蓝、肤色自然、不要锐化」）  
 3. **保存格式**：PNG/JPG 均可；推荐分辨率 ≥ **480px**（短边）。  
-4. **文件放置**：本应用会自动放置为 `ref/<视频名>/ref.png`。  
+4. **文件放置**：本应用会自动放置为 `ref/<文件夹名>/ref.png`。  
 
-**注意事项（Do/Don’t）**  
+**注意事项（Do/Don't）**  
 - ✅ 主体清晰、颜色干净，不要过曝或强滤镜。  
 - ✅ 关键区域（衣服、皮肤、头发、天空等）颜色与目标风格一致。  
 - ❌ 不要更改几何结构（如人脸形状/姿态），**只修改颜色**。  
@@ -101,16 +109,16 @@ REF_GUIDE_MD = r"""
 ---
 
 ### English Steps
-1. **Pick a frame** (or a similar photo) that matches the target shot in **pose / lighting / composition**.  
+1. **Pick a reference image** (or a similar photo) that matches the target images in **pose / lighting / composition**.  
 2. **Colorizing if your reference is B&W** — use **Qwen-Image (Image Editing)**:  
    - Open <https://chat.qwen.ai/> → **Image Editing**  
    - Upload your B&W reference  
-   - Prompt: **“Help me colorize this photo; only change colors, do not alter the content.”**  
-   - Iterate if needed (e.g., “vintage blue jacket, natural skin tone; avoid sharpening”).  
+   - Prompt: **"Help me colorize this photo; only change colors, do not alter the content."**  
+   - Iterate if needed (e.g., "vintage blue jacket, natural skin tone; avoid sharpening").  
 3. **Format**: PNG/JPG; recommended short side ≥ **480px**.  
-4. **File placement**: The app will place it as `ref/<video_stem>/ref.png`.
+4. **File placement**: The app will place it as `ref/<folder_name>/ref.png`.
 
-**Do / Don’t**
+**Do / Don't**
 - ✅ Clean subject and palette; avoid overexposure/harsh filters.  
 - ✅ Ensure key regions (clothes/skin/hair/sky) match the intended colors.  
 - ❌ Do not change geometry/structure — **colors only**.  
@@ -145,51 +153,52 @@ def ensure_checkpoint():
     except Exception as e:
         print(f"[WARN] 预下载权重失败（首次推理会再试）: {e}")
 
-# ----------------- VIDEO UTILS -----------------
-def video_to_frames_dir(video_path: str, frames_dir: str):
+# ----------------- IMAGE FOLDER UTILS -----------------
+def copy_images_to_frames_dir(input_folder: str, frames_dir: str):
     """
-    抽帧到 frames_dir/00000.png ...
-    返回: (w, h, fps, n_frames)
+    Copy images from input_folder to frames_dir with sequential naming (00000.png, 00001.png, ...)
+    Returns: number of images copied
     """
     ensure_dir(frames_dir)
-    cap = cv2.VideoCapture(video_path)
-    assert cap.isOpened(), f"Cannot open video: {video_path}"
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    idx = 0
-    w = h = None
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame is None:
-            continue
-        h, w = frame.shape[:2]
-        out_path = path.join(frames_dir, f"{idx:05d}.png")
-        ok = cv2.imwrite(out_path, frame)
-        if not ok:
-            raise RuntimeError(f"写入抽帧失败 / Failed to write: {out_path}")
-        idx += 1
-    cap.release()
-    if idx == 0:
-        raise RuntimeError("视频无可读帧 / Input video has no readable frames.")
-    return w, h, fps, idx
+    
+    # Get all image files
+    valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif')
+    image_files = []
+    for f in os.listdir(input_folder):
+        if f.lower().endswith(valid_extensions):
+            image_files.append(f)
+    
+    if not image_files:
+        raise RuntimeError(f"No image files found in {input_folder}")
+    
+    # Sort files to maintain order
+    image_files.sort()
+    
+    # Copy and rename images
+    for idx, img_file in enumerate(image_files):
+        src_path = path.join(input_folder, img_file)
+        dst_path = path.join(frames_dir, f"{idx:05d}.png")
+        
+        # Read and save as PNG to ensure consistent format
+        try:
+            img = Image.open(src_path)
+            img.save(dst_path, "PNG")
+        except Exception as e:
+            raise RuntimeError(f"Failed to process image {img_file}: {e}")
+    
+    return len(image_files)
 
-def encode_frames_to_video(frames_dir: str, out_path: str, fps: float):
-    frames = sorted([f for f in os.listdir(frames_dir) if f.lower().endswith(".png")])
-    if not frames:
-        raise RuntimeError(f"No frames found in {frames_dir}")
-    first = cv2.imread(path.join(frames_dir, frames[0]))
-    if first is None:
-        raise RuntimeError(f"Failed to read first frame {frames[0]}")
-    h, w = first.shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    vw = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
-    for f in frames:
-        img = cv2.imread(path.join(frames_dir, f))
-        if img is None:
-            continue
-        vw.write(img)
-    vw.release()
+def create_output_zip(output_folder: str, zip_path: str):
+    """
+    Create a zip file containing all output images
+    """
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(output_folder):
+            for file in files:
+                if file.lower().endswith('.png'):
+                    file_path = path.join(root, file)
+                    arcname = path.relpath(file_path, output_folder)
+                    zipf.write(file_path, arcname)
 
 # ----------------- CLI MAPPING -----------------
 CONFIG_TO_CLI = {
@@ -242,7 +251,7 @@ def build_args_list_for_test(d16_batch_path: str,
 def gradio_infer(
     debug_shapes,
     gpu_id,                   # <--- 新增：UI 传入的 GPU ID (int)
-    bw_video, ref_image,
+    input_folder_path, ref_image,
     first_not_exemplar, dataset, split, save_all, benchmark,
     disable_long_term, max_mid, min_mid, max_long,
     num_proto, top_k, mem_every, deep_update,
@@ -263,39 +272,44 @@ def gradio_infer(
         print(f"[WARN] set_device failed or CUDA not available: {e}")
 
     # 1) 基本校验与临时目录
-    if bw_video is None:
-        return None, "请上传黑白视频 / Please upload a B&W video."
+    if not input_folder_path or not input_folder_path.strip():
+        return None, "请输入图像文件夹路径 / Please enter image folder path."
     if ref_image is None:
         return None, "请上传参考图像 / Please upload a reference image."
+    
+    input_folder_path = input_folder_path.strip()
+    
+    # Verify folder exists
+    if not path.exists(input_folder_path):
+        return None, f"文件夹不存在 / Folder not found: {input_folder_path}"
+    if not path.isdir(input_folder_path):
+        return None, f"路径不是文件夹 / Path is not a directory: {input_folder_path}"
+    
     reset_temp_root()
 
-    # 2) 解析视频源路径 & 目标 <video_stem>
-    if isinstance(bw_video, dict) and "name" in bw_video:
-        src_video_path = bw_video["name"]
-    elif isinstance(bw_video, str):
-        src_video_path = bw_video
-    else:
-        return None, "无法读取视频输入 / Failed to read video input."
-
-    video_stem = path.splitext(path.basename(src_video_path))[0]
+    # 2) 解析文件夹名称
+    folder_name = path.basename(path.normpath(input_folder_path))
+    if not folder_name:
+        folder_name = "images"
 
     # 3) 生成临时路径
     input_root = path.join(TEMP_ROOT, INPUT_DIR)     # _colormnet_tmp/input_video
     ref_root   = path.join(TEMP_ROOT, REF_DIR)       # _colormnet_tmp/ref
     output_root= path.join(TEMP_ROOT, OUTPUT_DIR)    # _colormnet_tmp/output
-    input_frames_dir = path.join(input_root, video_stem)
-    ref_dir = path.join(ref_root, video_stem)
-    out_frames_dir = path.join(output_root, video_stem)
+    input_frames_dir = path.join(input_root, folder_name)
+    ref_dir = path.join(ref_root, folder_name)
+    out_frames_dir = path.join(output_root, folder_name)
     for d in (input_root, ref_root, output_root, input_frames_dir, ref_dir, out_frames_dir):
         ensure_dir(d)
 
-    # 4) 抽帧 -> input_video/<stem>/
+    # 4) 复制图像 -> input_video/<folder_name>/
     try:
-        _w, _h, fps, _n = video_to_frames_dir(src_video_path, input_frames_dir)
+        n_images = copy_images_to_frames_dir(input_folder_path, input_frames_dir)
+        print(f"[INFO] Copied {n_images} images from {input_folder_path}")
     except Exception as e:
-        return None, f"抽帧失败 / Frame extraction failed:\n{e}"
+        return None, f"复制图像失败 / Image copy failed:\n{e}"
 
-    # 5) 参考帧 -> ref/<stem>/ref.png
+    # 5) 参考帧 -> ref/<folder_name>/ref.png
     ref_png_path = path.join(ref_dir, "ref.png")
     if isinstance(ref_image, Image.Image):
         try:
@@ -361,8 +375,8 @@ def gradio_infer(
 
     args_list = build_args_list_for_test(
         d16_batch_path=input_root,   # 指向 input_video 根
-        out_path=output_root,        # 指向 output 根（test.py 写 output/<stem>/*.png）
-        ref_root=ref_root,           # 指向 ref 根（test.py 读 ref/<stem>/ref.png）
+        out_path=output_root,        # 指向 output 根（test.py 写 output/<folder_name>/*.png）
+        ref_root=ref_root,           # 指向 ref 根（test.py 读 ref/<folder_name>/ref.png）
         cfg=user_config
     )
 
@@ -380,7 +394,7 @@ def gradio_infer(
               f"Args: {' '.join(args_list)}\n\n{buf.getvalue()}\n\nERROR: {e}"
         return None, log
 
-    # 在合成 mp4 之前：清空 CUDA（防止显存占用）
+    # 清空 CUDA（防止显存占用）
     try:
         torch.cuda.synchronize()
     except Exception:
@@ -390,17 +404,34 @@ def gradio_infer(
     except Exception:
         pass
 
-    # 9) 合成 mp4：从 output/<stem>/ 帧合成 -> TEMP_ROOT/<stem>.mp4
-    out_frames = path.join(output_root, video_stem)
+    # 9) 创建输出 zip 文件
+    out_frames = path.join(output_root, folder_name)
     if not path.isdir(out_frames):
         return None, f"未找到输出帧目录 / Output frame dir not found：{out_frames}\n\n{log}"
-    final_mp4 = path.abspath(path.join(TEMP_ROOT, f"{video_stem}.mp4"))
+    
+    # Count output images
+    output_images = [f for f in os.listdir(out_frames) if f.lower().endswith('.png')]
+    if not output_images:
+        return None, f"未生成输出图像 / No output images generated in：{out_frames}\n\n{log}"
+    
+    final_zip = path.abspath(path.join(TEMP_ROOT, f"{folder_name}_output.zip"))
     try:
-        encode_frames_to_video(out_frames, final_mp4, fps=fps)
+        create_output_zip(out_frames, final_zip)
     except Exception as e:
-        return None, f"合成视频失败 / Video mux failed：\n{e}\n\n{log}"
+        return None, f"创建输出 zip 失败 / Failed to create output zip：\n{e}\n\n{log}"
 
-    return final_mp4, f"完成 ✅ / Done ✅\n\n{log}"
+    # Verify the output zip was created
+    if not path.exists(final_zip):
+        return None, f"输出 zip 未生成 / Output zip not created: {final_zip}\n\n{log}"
+    
+    file_size = path.getsize(final_zip)
+    if file_size == 0:
+        return None, f"输出 zip 为空 / Output zip is empty: {final_zip}\n\n{log}"
+
+    log += f"\n[INFO] Created zip with {len(output_images)} images, {file_size} bytes"
+    log += f"\n[INFO] Output folder: {out_frames}"
+
+    return final_zip, f"完成 ✅ / Done ✅\n输出路径 / Output: {final_zip}\n图像数量 / Images: {len(output_images)}\n文件大小 / Size: {file_size} bytes\n\n{log}"
 
 # ----------------- UI -----------------
 with gr.Blocks() as demo:
@@ -417,14 +448,8 @@ with gr.Blocks() as demo:
         debug_shapes = gr.Checkbox(label="调试日志 / Debug Logs（仅用于显示更完整日志 / show verbose logs）", value=False)
 
     with gr.Row():
-        inp_video = gr.Video(label="黑白视频（mp4/webm/avi） / B&W Video", interactive=True)
+        inp_folder = gr.Textbox(label="图像文件夹路径 / Image Folder Path", placeholder="/path/to/your/images")
         inp_ref = gr.Image(label="参考图像（RGB） / Reference Image (RGB)", type="pil")
-        gr.Examples(
-            label="示例 / Examples",
-            examples=[["./example/4.mp4", "./example/4.png"]],
-            inputs=[inp_video, inp_ref],
-            cache_examples=False,
-        )
 
     with gr.Accordion("高级参数设置 / Advanced Settings（传给 test.py / passed to test.py）", open=False):
         with gr.Row():
@@ -450,7 +475,7 @@ with gr.Blocks() as demo:
 
     run_btn = gr.Button("开始着色 / Start Coloring (Local GPU)")
     with gr.Row():
-        out_video = gr.Video(label="输出视频（着色结果） / Output (Colorized)", autoplay=True)
+        out_file = gr.File(label="输出文件（着色结果 ZIP） / Output (Colorized Images ZIP)")
         status = gr.Textbox(label="状态 / 日志输出 / Status & Logs", interactive=False, lines=16)
 
     run_btn.click(
@@ -458,13 +483,13 @@ with gr.Blocks() as demo:
         inputs=[
             debug_shapes,
             gpu_id,
-            inp_video, inp_ref,
+            inp_folder, inp_ref,
             first_not_exemplar, dataset, split, save_all, benchmark,
             disable_long_term, max_mid, min_mid, max_long,
             num_proto, top_k, mem_every, deep_update,
             save_scores, flip, size, reverse
         ],
-        outputs=[out_video, status]
+        outputs=[out_file, status]
     )
 
     gr.HTML("<hr/>")
