@@ -251,7 +251,7 @@ def build_args_list_for_test(d16_batch_path: str,
 def gradio_infer(
     debug_shapes,
     gpu_id,                   # <--- 新增：UI 传入的 GPU ID (int)
-    input_folder_path, ref_image,
+    input_folder_path, ref_image, ref_folder_path,
     first_not_exemplar, dataset, split, save_all, benchmark,
     disable_long_term, max_mid, min_mid, max_long,
     num_proto, top_k, mem_every, deep_update,
@@ -274,8 +274,20 @@ def gradio_infer(
     # 1) 基本校验与临时目录
     if not input_folder_path or not input_folder_path.strip():
         return None, "请输入图像文件夹路径 / Please enter image folder path."
-    if ref_image is None:
-        return None, "请上传参考图像 / Please upload a reference image."
+    
+    # Check for reference: either single image OR folder path
+    has_ref_image = ref_image is not None
+    has_ref_folder = ref_folder_path and ref_folder_path.strip()
+    
+    if not has_ref_image and not has_ref_folder:
+        return None, "请上传参考图像或输入参考图像文件夹路径 / Please upload a reference image or enter a reference folder path."
+    
+    if has_ref_folder:
+        ref_folder_path = ref_folder_path.strip()
+        if not path.exists(ref_folder_path):
+            return None, f"参考图像文件夹不存在 / Reference folder not found: {ref_folder_path}"
+        if not path.isdir(ref_folder_path):
+            return None, f"参考图像路径不是文件夹 / Reference path is not a directory: {ref_folder_path}"
     
     input_folder_path = input_folder_path.strip()
     
@@ -309,20 +321,29 @@ def gradio_infer(
     except Exception as e:
         return None, f"复制图像失败 / Image copy failed:\n{e}"
 
-    # 5) 参考帧 -> ref/<folder_name>/ref.png
-    ref_png_path = path.join(ref_dir, "ref.png")
-    if isinstance(ref_image, Image.Image):
+    # 5) 参考帧 -> ref/<folder_name>/ref.png (single) or ref/<folder_name>/00000.png, 00001.png... (multiple)
+    if has_ref_folder:
+        # Multiple reference images from folder
         try:
-            ref_image.save(ref_png_path)
+            n_refs = copy_images_to_frames_dir(ref_folder_path, ref_dir)
+            print(f"[INFO] Copied {n_refs} reference images from {ref_folder_path}")
         except Exception as e:
-            return None, f"保存参考图像失败 / Failed to save reference image:\n{e}"
-    elif isinstance(ref_image, str):
-        try:
-            shutil.copy2(ref_image, ref_png_path)
-        except Exception as e:
-            return None, f"复制参考图像失败 / Failed to copy reference image:\n{e}"
+            return None, f"复制参考图像失败 / Failed to copy reference images:\n{e}"
     else:
-        return None, "无法读取参考图像输入 / Failed to read reference image."
+        # Single reference image
+        ref_png_path = path.join(ref_dir, "ref.png")
+        if isinstance(ref_image, Image.Image):
+            try:
+                ref_image.save(ref_png_path)
+            except Exception as e:
+                return None, f"保存参考图像失败 / Failed to save reference image:\n{e}"
+        elif isinstance(ref_image, str):
+            try:
+                shutil.copy2(ref_image, ref_png_path)
+            except Exception as e:
+                return None, f"复制参考图像失败 / Failed to copy reference image:\n{e}"
+        else:
+            return None, "无法读取参考图像输入 / Failed to read reference image."
 
     # 6) 收集 UI 配置
     default_config = {
@@ -449,7 +470,8 @@ with gr.Blocks() as demo:
 
     with gr.Row():
         inp_folder = gr.Textbox(label="图像文件夹路径 / Image Folder Path", placeholder="/path/to/your/images")
-        inp_ref = gr.Image(label="参考图像（RGB） / Reference Image (RGB)", type="pil")
+        inp_ref = gr.Image(label="参考图像（单张） / Reference Image (single)", type="pil")
+        inp_ref_folder = gr.Textbox(label="参考图像文件夹路径（多张） / Reference Folder Path (multiple)", placeholder="/path/to/reference/images (可选 / optional)")
 
     with gr.Accordion("高级参数设置 / Advanced Settings（传给 test.py / passed to test.py）", open=False):
         with gr.Row():
@@ -483,7 +505,7 @@ with gr.Blocks() as demo:
         inputs=[
             debug_shapes,
             gpu_id,
-            inp_folder, inp_ref,
+            inp_folder, inp_ref, inp_ref_folder,
             first_not_exemplar, dataset, split, save_all, benchmark,
             disable_long_term, max_mid, min_mid, max_long,
             num_proto, top_k, mem_every, deep_update,
